@@ -3,8 +3,10 @@
 
 My own encryption implementation for my website to share files
 
-> **Status:** early development. The database, API keys and master key work.
-> The HTTP server (uploading and downloading files) is not built yet.
+> **Status:** early development. Files can be encrypted into storage and
+> decrypted back out with temporary `debug` commands. The HTTP server
+> (uploading and downloading over the web) and automatic cleanup of expired
+> files are not built yet.
 
 ## Requirements
 
@@ -19,16 +21,46 @@ go build -o filedrop ./cmd/filedrop
 
 This produces a single `filedrop` binary. Every command below is a subcommand of it.
 
-## Where files live
+## Configuration
 
-| What | Flag | Environment variable | Default |
+Settings come from environment variables, normally kept in a `.env` file.
+Copy the example and edit it:
+
+```sh
+cp .env.example .env
+```
+
+| Variable | What it sets | Default | Flag override |
 | --- | --- | --- | --- |
-| Database (SQLite) | `--db PATH` | `FILEDROP_DB` | `~/.local/share/filedrop/filedrop.db` |
-| Master key | `--master-key PATH` | `FILEDROP_MASTER_KEY` | `~/.local/share/filedrop/master.key` |
+| `FILEDROP_DB` | SQLite database file | `~/.local/share/filedrop/filedrop.db` | `--db PATH` |
+| `FILEDROP_MASTER_KEY` | Master key file | `~/.local/share/filedrop/master.key` | `--master-key PATH` |
+| `FILEDROP_DATA_DIR` | Directory for encrypted files | `~/.local/share/filedrop/files` | none |
+| `FILEDROP_MAX_FILE_BYTES` | Largest single upload, in bytes | `2147483648` (2 GiB) | none |
+| `FILEDROP_MAX_TOTAL_BYTES` | Total size of all stored files, in bytes | `10737418240` (10 GiB) | none |
 
 A flag beats the environment variable, which beats the default. Directories are
 created automatically. The database schema is created or upgraded automatically
 whenever a command opens it.
+
+`.env` is git-ignored; never commit it.
+
+### Loading `.env`
+
+Go doesn't read `.env` by itself; something has to turn it into environment
+variables.
+
+- **On the server (systemd):** the service unit loads it with
+  `EnvironmentFile=/path/to/.env`.
+- **For CLI commands in a shell** (on the server or this desktop), load it first
+  so the CLI uses the same database and key as the service:
+
+  ```sh
+  set -a; . ./.env; set +a
+  ./filedrop keys list
+  ```
+
+  Without this step, the CLI falls back to the default paths, which on the server
+  would be the wrong database.
 
 On the server, keep the master key on a **different drive** from the database and
 uploaded files, owned by the service's own user.
@@ -48,7 +80,33 @@ makes every stored file unreadable.
 
 Back the key up somewhere separate from the database and the uploaded files.
 
-### 2. Create an API key
+### 2. Create the database
+
+There is no separate step: the database file and its tables (`api_keys` and
+`files`) are created automatically the first time any command opens it. Running
+the next step, or simply
+
+```sh
+./filedrop keys list
+```
+
+creates them at the path in `FILEDROP_DB`.
+
+How it works: the table definitions live in `internal/db/migrations/` as numbered
+SQL files (`0001_init.sql`, ...) that are built into the binary. SQLite stores
+the number of the last one applied (`PRAGMA user_version`). Each time a command
+opens the database, any newer migration files are applied once, in order, so
+upgrading the binary also upgrades the schema.
+
+To look at the tables yourself:
+
+```sh
+sqlite3 "$FILEDROP_DB" '.tables'            # api_keys  files
+sqlite3 "$FILEDROP_DB" '.schema files'      # full table definition
+sqlite3 "$FILEDROP_DB" 'PRAGMA user_version' # last migration applied
+```
+
+### 3. Create an API key
 
 ```sh
 ./filedrop keys create --name laptop
@@ -72,6 +130,40 @@ Each key needs a unique name of at most 64 characters.
 | `filedrop masterkey init` | Create the master key (refuses to overwrite) |
 | `filedrop keys create --name NAME` | Create an API key and print it once |
 | `filedrop keys list` | List keys: ID, name, creation time, revoked status (never the keys themselves) |
+| `filedrop debug encrypt --key NAME [--downloads N] [--expires DUR] PATH` | *Temporary.* Encrypt a local file into storage and print its ID |
+| `filedrop debug decrypt -o OUT ID` | *Temporary.* Decrypt a stored file to `OUT` (`-` for standard output) |
+
+## Trying encryption (temporary `debug` commands)
+
+Until the HTTP server exists, these two commands run the same code that uploads
+and downloads will use. They will be removed once uploads and downloads work
+over HTTP.
+
+```sh
+set -a; . ./.env; set +a                   # same settings as the service
+
+# Encrypt: prints the file's ID (the secret part of a future share link)
+ID=$(./filedrop debug encrypt --key laptop --downloads 2 --expires 2h photo.jpg)
+
+# Decrypt to a new file (refuses to overwrite an existing one)
+./filedrop debug decrypt -o copy.jpg "$ID"
+
+# Or to standard output, e.g. to compare with the original
+./filedrop debug decrypt -o - "$ID" | sha256sum
+sha256sum photo.jpg
+```
+
+What happens:
+
+- **Encrypt** checks the size limits and reserves space, creates a new random
+  key for this file and wraps it with the master key, then streams the file
+  through encryption into `FILEDROP_DATA_DIR/<ID>`. The unencrypted contents are
+  never written to disk. If anything fails, the partial file is removed and the
+  space is given back.
+- **Decrypt counts as a download.** Once the download limit is used up, further
+  decrypts fail with "no downloads left". A failed decrypt doesn't use one up.
+- Defaults: `--downloads 1` (use `-1` for unlimited), `--expires 24h` (the maximum).
+- Not built yet: expired or used-up files stay on disk until the cleaner exists.
 
 ## Development
 
