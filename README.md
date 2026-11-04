@@ -4,9 +4,9 @@
 My own encryption implementation for my website to share files
 
 > **Status:** early development. Files can be encrypted into storage and
-> decrypted back out with temporary `debug` commands. The HTTP server
-> (uploading and downloading over the web) and automatic cleanup of expired
-> files are not built yet.
+> decrypted back out with temporary `debug` commands, and `filedrop serve`
+> runs the cleaner that removes expired, used-up and revoked files. The HTTP
+> server (uploading and downloading over the web) is not built yet.
 
 ## Requirements
 
@@ -37,6 +37,7 @@ cp .env.example .env
 | `FILEDROP_DATA_DIR` | Directory for encrypted files | `~/.local/share/filedrop/files` | none |
 | `FILEDROP_MAX_FILE_BYTES` | Largest single upload, in bytes | `2147483648` (2 GiB) | none |
 | `FILEDROP_MAX_TOTAL_BYTES` | Total size of all stored files, in bytes | `10737418240` (10 GiB) | none |
+| `FILEDROP_SWEEP_INTERVAL` | How often the cleaner runs (Go duration, at least `1s`) | `5m` | none |
 
 A flag beats the environment variable, which beats the default. Directories are
 created automatically. The database schema is created or upgraded automatically
@@ -130,8 +131,45 @@ Each key needs a unique name of at most 64 characters.
 | `filedrop masterkey init` | Create the master key (refuses to overwrite) |
 | `filedrop keys create --name NAME` | Create an API key and print it once |
 | `filedrop keys list` | List keys: ID, name, creation time, revoked status (never the keys themselves) |
+| `filedrop keys revoke NAME` | Revoke a key; its files become undownloadable at once and are removed from disk by the next sweep |
+| `filedrop serve` | Run the service. For now this is only the cleaner; stop it with Ctrl-C or SIGTERM |
 | `filedrop debug encrypt --key NAME [--downloads N] [--expires DUR] PATH` | *Temporary.* Encrypt a local file into storage and print its ID |
 | `filedrop debug decrypt -o OUT ID` | *Temporary.* Decrypt a stored file to `OUT` (`-` for standard output) |
+
+## Running the service and cleanup
+
+```sh
+set -a; . ./.env; set +a
+./filedrop serve
+```
+
+`serve` runs until stopped with Ctrl-C (or SIGTERM, which systemd sends). Logs
+go to standard error; under systemd, `journalctl` shows them. Logs show only
+the first 6 characters of a file ID, because the full ID is the secret part of
+a share link.
+
+For now `serve` only runs the **cleaner**, the one part of the program that
+deletes files. On startup it releases any download slots left over from a
+previous run and abandons unfinished uploads. It then sweeps immediately and
+again every `FILEDROP_SWEEP_INTERVAL`. Each sweep:
+
+1. marks files that have **expired** or **used up their downloads**, and that
+   nobody is currently downloading, as deleted, which also frees their storage;
+2. removes the encrypted data of every deleted file from disk.
+
+A file being downloaded is never removed mid-download; the next sweep after
+the download finishes takes care of it.
+
+### Revoking a key
+
+```sh
+./filedrop keys revoke laptop
+```
+
+The key stops working, and every file it uploaded becomes undownloadable
+immediately. Those files are removed from disk on the cleaner's next sweep, so
+`serve` must be running (or be started later) for that to happen. Revoking
+can't be undone; create a new key instead.
 
 ## Trying encryption (temporary `debug` commands)
 
@@ -163,7 +201,10 @@ What happens:
 - **Decrypt counts as a download.** Once the download limit is used up, further
   decrypts fail with "no downloads left". A failed decrypt doesn't use one up.
 - Defaults: `--downloads 1` (use `-1` for unlimited), `--expires 24h` (the maximum).
-- Not built yet: expired or used-up files stay on disk until the cleaner exists.
+- Expired and used-up files are removed by the cleaner in `filedrop serve`.
+- Don't start `serve` while a `debug` command is running in another terminal:
+  `serve`'s startup treats in-progress uploads and downloads as leftovers from
+  a crash. (Once HTTP exists, all of these run inside `serve`.)
 
 ## Development
 

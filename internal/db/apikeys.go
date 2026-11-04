@@ -83,3 +83,34 @@ func (d *DB) GetAPIKeyByName(ctx context.Context, name string) (APIKey, error) {
 	k.CreatedAt = time.Unix(created, 0)
 	return k, nil
 }
+
+// RevokeAPIKey revokes the named key and, in the same transaction, marks all
+// of its files deleted and locked, so they can't be downloaded from this
+// moment on and stop counting against storage. The cleaner removes them from
+// disk on its next sweep. It returns how many files were affected. Revoking
+// an already-revoked key is allowed.
+func (d *DB) RevokeAPIKey(ctx context.Context, name string) (files int64, err error) {
+	tx, err := d.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback() // no-op after Commit
+
+	var id int64
+	err = tx.QueryRowContext(ctx, `UPDATE api_keys SET revoked = 1 WHERE name = ? RETURNING id`, name).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, ErrKeyNotFound
+	}
+	if err != nil {
+		return 0, fmt.Errorf("revoke api key: %w", err)
+	}
+	res, err := tx.ExecContext(ctx,
+		`UPDATE files SET status = 'deleted', locked = 1 WHERE api_key_id = ? AND status != 'deleted'`, id)
+	if err != nil {
+		return 0, fmt.Errorf("delete revoked key's files: %w", err)
+	}
+	if files, err = res.RowsAffected(); err != nil {
+		return 0, err
+	}
+	return files, tx.Commit()
+}

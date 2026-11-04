@@ -11,12 +11,15 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"time"
 )
 
 // Defaults for the size limits, in bytes (binary units).
 const (
 	DefaultMaxFileBytes  int64 = 2 << 30  // 2 GiB
 	DefaultMaxTotalBytes int64 = 10 << 30 // 10 GiB
+
+	DefaultSweepInterval = 5 * time.Minute
 )
 
 // Config holds every setting. Command-line flags may override the paths.
@@ -26,6 +29,8 @@ type Config struct {
 	DataDir       string // FILEDROP_DATA_DIR: where encrypted files are stored
 	MaxFileBytes  int64  // FILEDROP_MAX_FILE_BYTES: largest single upload
 	MaxTotalBytes int64  // FILEDROP_MAX_TOTAL_BYTES: all pending + ready files together
+
+	SweepInterval time.Duration // FILEDROP_SWEEP_INTERVAL: how often the cleaner runs
 }
 
 // Load reads settings through getenv (normally os.Getenv), filling in defaults
@@ -44,6 +49,12 @@ func Load(getenv func(string) string) (Config, error) {
 	}
 	if c.MaxTotalBytes, err = bytesVar(getenv, "FILEDROP_MAX_TOTAL_BYTES", DefaultMaxTotalBytes); err != nil {
 		return Config{}, err
+	}
+	c.SweepInterval = DefaultSweepInterval
+	if v := getenv("FILEDROP_SWEEP_INTERVAL"); v != "" {
+		if c.SweepInterval, err = time.ParseDuration(v); err != nil || c.SweepInterval < time.Second {
+			return Config{}, fmt.Errorf("FILEDROP_SWEEP_INTERVAL must be a duration of at least 1s, such as 5m, got %q", v)
+		}
 	}
 	if c.MaxTotalBytes < c.MaxFileBytes {
 		return Config{}, fmt.Errorf("FILEDROP_MAX_TOTAL_BYTES (%d) must be at least FILEDROP_MAX_FILE_BYTES (%d)",
