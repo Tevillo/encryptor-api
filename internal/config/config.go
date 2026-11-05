@@ -8,9 +8,11 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -20,6 +22,8 @@ const (
 	DefaultMaxTotalBytes int64 = 10 << 30 // 10 GiB
 
 	DefaultSweepInterval = 5 * time.Minute
+
+	DefaultListen = "127.0.0.1:8090"
 )
 
 // Config holds every setting. Command-line flags may override the paths.
@@ -31,6 +35,9 @@ type Config struct {
 	MaxTotalBytes int64  // FILEDROP_MAX_TOTAL_BYTES: all pending + ready files together
 
 	SweepInterval time.Duration // FILEDROP_SWEEP_INTERVAL: how often the cleaner runs
+
+	Listen    string // FILEDROP_LISTEN: address the HTTP server binds, e.g. 127.0.0.1:8090
+	PublicURL string // FILEDROP_PUBLIC_URL: start of every share link, without trailing slash
 }
 
 // Load reads settings through getenv (normally os.Getenv), filling in defaults
@@ -55,6 +62,11 @@ func Load(getenv func(string) string) (Config, error) {
 		if c.SweepInterval, err = time.ParseDuration(v); err != nil || c.SweepInterval < time.Second {
 			return Config{}, fmt.Errorf("FILEDROP_SWEEP_INTERVAL must be a duration of at least 1s, such as 5m, got %q", v)
 		}
+	}
+	c.Listen = orDefault(getenv("FILEDROP_LISTEN"), DefaultListen)
+	c.PublicURL = strings.TrimRight(orDefault(getenv("FILEDROP_PUBLIC_URL"), "http://"+c.Listen+"/filedrop"), "/")
+	if u, err := url.Parse(c.PublicURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return Config{}, fmt.Errorf("FILEDROP_PUBLIC_URL must be an http(s) URL such as https://paulborrego.com/filedrop, got %q", c.PublicURL)
 	}
 	if c.MaxTotalBytes < c.MaxFileBytes {
 		return Config{}, fmt.Errorf("FILEDROP_MAX_TOTAL_BYTES (%d) must be at least FILEDROP_MAX_FILE_BYTES (%d)",

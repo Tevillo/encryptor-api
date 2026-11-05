@@ -3,10 +3,10 @@
 
 My own encryption implementation for my website to share files
 
-> **Status:** early development. Files can be encrypted into storage and
-> decrypted back out with temporary `debug` commands, and `filedrop serve`
-> runs the cleaner that removes expired, used-up and revoked files. The HTTP
-> server (uploading and downloading over the web) is not built yet.
+> **Status:** early development. `filedrop serve` accepts encrypted uploads
+> and serves downloads over HTTP, and its cleaner removes expired, used-up and
+> revoked files. Not done yet: deployment behind Caddy/systemd and a browser
+> frontend.
 
 ## Requirements
 
@@ -38,6 +38,8 @@ cp .env.example .env
 | `FILEDROP_MAX_FILE_BYTES` | Largest single upload, in bytes | `2147483648` (2 GiB) | none |
 | `FILEDROP_MAX_TOTAL_BYTES` | Total size of all stored files, in bytes | `10737418240` (10 GiB) | none |
 | `FILEDROP_SWEEP_INTERVAL` | How often the cleaner runs (Go duration, at least `1s`) | `5m` | none |
+| `FILEDROP_LISTEN` | Address the HTTP server listens on | `127.0.0.1:8090` | none |
+| `FILEDROP_PUBLIC_URL` | Start of every share link (no trailing slash) | `http://<FILEDROP_LISTEN>/filedrop` | none |
 
 A flag beats the environment variable, which beats the default. Directories are
 created automatically. The database schema is created or upgraded automatically
@@ -132,9 +134,7 @@ Each key needs a unique name of at most 64 characters.
 | `filedrop keys create --name NAME` | Create an API key and print it once |
 | `filedrop keys list` | List keys: ID, name, creation time, revoked status (never the keys themselves) |
 | `filedrop keys revoke NAME` | Revoke a key; its files become undownloadable at once and are removed from disk by the next sweep |
-| `filedrop serve` | Run the service. For now this is only the cleaner; stop it with Ctrl-C or SIGTERM |
-| `filedrop debug encrypt --key NAME [--downloads N] [--expires DUR] PATH` | *Temporary.* Encrypt a local file into storage and print its ID |
-| `filedrop debug decrypt -o OUT ID` | *Temporary.* Decrypt a stored file to `OUT` (`-` for standard output) |
+| `filedrop serve` | Run the service: the HTTP server and the cleaner. Stop it with Ctrl-C or SIGTERM |
 
 ## Running the service and cleanup
 
@@ -143,15 +143,20 @@ set -a; . ./.env; set +a
 ./filedrop serve
 ```
 
-`serve` runs until stopped with Ctrl-C (or SIGTERM, which systemd sends). Logs
-go to standard error; under systemd, `journalctl` shows them. Logs show only
-the first 6 characters of a file ID, because the full ID is the secret part of
-a share link.
+`serve` runs the HTTP server on `FILEDROP_LISTEN` and the cleaner, until
+stopped with Ctrl-C (or SIGTERM, which systemd sends). On stop it accepts no
+new requests and gives transfers in progress up to 30 seconds to finish.
 
-For now `serve` only runs the **cleaner**, the one part of the program that
-deletes files. On startup it releases any download slots left over from a
-previous run and abandons unfinished uploads. It then sweeps immediately and
-again every `FILEDROP_SWEEP_INTERVAL`. Each sweep:
+Logs go to standard error; under systemd, `journalctl` shows them. Requests are
+logged by route (`GET /filedrop/{id}`), never by their real path, and file IDs
+are cut to 6 characters, because the full ID is the secret part of a share link.
+
+### Cleanup
+
+The **cleaner** is the one part of the program that deletes files. On startup
+it releases any download slots left over from a previous run and abandons
+unfinished uploads, before the HTTP server accepts requests. It then sweeps
+immediately and again every `FILEDROP_SWEEP_INTERVAL`. Each sweep:
 
 1. marks files that have **expired** or **used up their downloads**, and that
    nobody is currently downloading, as deleted, which also frees their storage;
@@ -167,44 +172,94 @@ the download finishes takes care of it.
 ```
 
 The key stops working, and every file it uploaded becomes undownloadable
-immediately. Those files are removed from disk on the cleaner's next sweep, so
-`serve` must be running (or be started later) for that to happen. Revoking
-can't be undone; create a new key instead.
+immediately. Downloads already in progress are cut off within about 10 seconds.
+The files are removed from disk on the cleaner's next sweep. Revoking can't be
+undone; create a new key instead.
 
-## Trying encryption (temporary `debug` commands)
+## Uploading and downloading
 
-Until the HTTP server exists, these two commands run the same code that uploads
-and downloads will use. They will be removed once uploads and downloads work
-over HTTP.
+Examples use `https://paulborrego.com/filedrop`; locally, use your
+`FILEDROP_PUBLIC_URL` (by default `http://127.0.0.1:8090/filedrop`).
+
+### Upload
 
 ```sh
-set -a; . ./.env; set +a                   # same settings as the service
-
-# Encrypt: prints the file's ID (the secret part of a future share link)
-ID=$(./filedrop debug encrypt --key laptop --downloads 2 --expires 2h photo.jpg)
-
-# Decrypt to a new file (refuses to overwrite an existing one)
-./filedrop debug decrypt -o copy.jpg "$ID"
-
-# Or to standard output, e.g. to compare with the original
-./filedrop debug decrypt -o - "$ID" | sha256sum
-sha256sum photo.jpg
+curl -T "holiday photo.jpg" \
+     -H "Authorization: Bearer $KEY" \
+     --url-query expires=2h --url-query downloads=3 \
+     https://paulborrego.com/filedrop/
 ```
 
-What happens:
+The response is the share link, on one line:
 
-- **Encrypt** checks the size limits and reserves space, creates a new random
-  key for this file and wraps it with the master key, then streams the file
-  through encryption into `FILEDROP_DATA_DIR/<ID>`. The unencrypted contents are
-  never written to disk. If anything fails, the partial file is removed and the
-  space is given back.
-- **Decrypt counts as a download.** Once the download limit is used up, further
-  decrypts fail with "no downloads left". A failed decrypt doesn't use one up.
-- Defaults: `--downloads 1` (use `-1` for unlimited), `--expires 24h` (the maximum).
-- Expired and used-up files are removed by the cleaner in `filedrop serve`.
-- Don't start `serve` while a `debug` command is running in another terminal:
-  `serve`'s startup treats in-progress uploads and downloads as leftovers from
-  a crash. (Once HTTP exists, all of these run inside `serve`.)
+```
+https://paulborrego.com/filedrop/lLwqZ6_kBjVaTSUo0ww8mA
+```
+
+so `LINK=$(curl ...)` captures it.
+
+- `-T FILE` sends the file as the request body. Because the URL ends in `/`,
+  curl adds the file name to it (`.../filedrop/holiday%20photo.jpg`), and that
+  name is what the recipient's download is saved as.
+- **Use `--url-query` for settings, not `?` in the URL.** curl only adds the
+  file name when the URL ends in `/` with nothing after it; with
+  `.../filedrop/?expires=2h` the name is dropped and the server answers `404`.
+  (Alternatively, write the name yourself:
+  `.../filedrop/holiday%20photo.jpg?expires=2h`.)
+- The file is encrypted as it arrives; the unencrypted contents never touch the
+  server's disk.
+
+| Setting | Values | Default |
+| --- | --- | --- |
+| `expires` | Go duration from `1s` to `24h`, e.g. `30m`, `2h` | `24h` |
+| `downloads` | `-1` (unlimited) or at least `1` | `1` |
+
+Any other setting name is rejected, so a typo like `expire=2h` fails instead of
+silently using the default.
+
+### Download
+
+Anyone with the link can download; no key is needed:
+
+```sh
+curl -OJ https://paulborrego.com/filedrop/lLwqZ6_kBjVaTSUo0ww8mA
+```
+
+`-O -J` saves the file under its original name. Each successful download uses
+one of the file's downloads; a download that fails partway doesn't. While all
+remaining downloads are in progress at once, further requests get `409`.
+`HEAD` requests are refused so they can't use up a download.
+
+**Link previews:** chat apps (Slack, iMessage, ...) often fetch pasted links to
+build a preview, and that fetch counts as a download. Share links where that
+won't happen, or allow more than one download.
+
+### Responses
+
+| Status | Meaning |
+| --- | --- |
+| `201` | Uploaded; the body is the share link |
+| `200` | Download follows |
+| `400` | Invalid setting, file name, or the upload didn't complete |
+| `401` | Missing, unknown or revoked API key |
+| `404` | No such file (or no file name in the upload URL) |
+| `405` | Wrong method, e.g. `HEAD` on a link |
+| `409` | All of the file's remaining downloads are in progress; try again later |
+| `410` | Expired, used up, or deleted |
+| `411` | No `Content-Length`; upload a file, not a pipe |
+| `413` | Larger than `FILEDROP_MAX_FILE_BYTES` |
+| `507` | Total storage (`FILEDROP_MAX_TOTAL_BYTES`) is full |
+
+Errors are a single line of text starting with `error:`.
+
+A transfer that makes no progress for 60 seconds is cut off, and a cut-off
+upload leaves nothing behind.
+
+### Not built yet
+
+- Deployment: a systemd unit and the Caddy route for `/filedrop/*`.
+- A browser frontend. It will need its own way to authenticate senders, since
+  an API key embedded in a web page is visible to anyone using it.
 
 ## Development
 
@@ -219,4 +274,5 @@ throwaway folder:
 ```sh
 export FILEDROP_DB=/tmp/filedrop-test/filedrop.db
 export FILEDROP_MASTER_KEY=/tmp/filedrop-test/master.key
+export FILEDROP_DATA_DIR=/tmp/filedrop-test/files
 ```

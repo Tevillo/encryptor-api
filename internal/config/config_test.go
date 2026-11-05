@@ -17,6 +17,9 @@ func TestLoadDefaults(t *testing.T) {
 	if c.MaxFileBytes != 2<<30 || c.MaxTotalBytes != 10<<30 {
 		t.Fatalf("limits = %d / %d, want 2 GiB / 10 GiB", c.MaxFileBytes, c.MaxTotalBytes)
 	}
+	if c.Listen != "127.0.0.1:8090" || c.PublicURL != "http://127.0.0.1:8090/filedrop" {
+		t.Fatalf("listen=%q public=%q", c.Listen, c.PublicURL)
+	}
 	if c.SweepInterval != 5*time.Minute {
 		t.Fatalf("sweep interval = %s, want 5m", c.SweepInterval)
 	}
@@ -33,12 +36,15 @@ func TestLoadFromEnv(t *testing.T) {
 		"FILEDROP_MAX_FILE_BYTES":  "100",
 		"FILEDROP_MAX_TOTAL_BYTES": "1000",
 		"FILEDROP_SWEEP_INTERVAL":  "90s",
+		"FILEDROP_LISTEN":          "127.0.0.1:9000",
+		"FILEDROP_PUBLIC_URL":      "https://example.com/filedrop/",
 	}))
 	if err != nil {
 		t.Fatal(err)
 	}
 	want := Config{DBPath: "/data/f.db", MasterKeyPath: "/keys/master.key", DataDir: "/data/files",
-		MaxFileBytes: 100, MaxTotalBytes: 1000, SweepInterval: 90 * time.Second}
+		MaxFileBytes: 100, MaxTotalBytes: 1000, SweepInterval: 90 * time.Second,
+		Listen: "127.0.0.1:9000", PublicURL: "https://example.com/filedrop"}
 	if c != want {
 		t.Fatalf("got %+v, want %+v", c, want)
 	}
@@ -54,6 +60,7 @@ func TestLoadRejectsBadLimits(t *testing.T) {
 		{"negative", map[string]string{"FILEDROP_MAX_FILE_BYTES": "-5"}},
 		{"sweep interval not a duration", map[string]string{"FILEDROP_SWEEP_INTERVAL": "5"}},
 		{"sweep interval too short", map[string]string{"FILEDROP_SWEEP_INTERVAL": "10ms"}},
+		{"public url without scheme", map[string]string{"FILEDROP_PUBLIC_URL": "paulborrego.com/filedrop"}},
 		{"total below per-file", map[string]string{"FILEDROP_MAX_FILE_BYTES": "100", "FILEDROP_MAX_TOTAL_BYTES": "99"}},
 	}
 	for _, tt := range tests {
