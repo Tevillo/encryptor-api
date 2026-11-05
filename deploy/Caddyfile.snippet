@@ -1,0 +1,23 @@
+# How the paulborrego.com site block in the Caddyfile (often
+# /etc/caddy/Caddyfile) should look: add the /filedrop/* handle and wrap the
+# site's existing proxy in its own handle.
+#
+# Use `handle`, not `handle_path`: handle_path strips /filedrop from the path
+# before proxying, and filedrop's routes expect it (/filedrop/{id}).
+#
+# Request and response bodies are streamed, so large uploads and downloads are
+# not buffered in Caddy.
+#
+# If this site block has a `log` directive, Caddy's access log records full
+# URLs, which include the secret part of every share link.
+
+paulborrego.com {
+	handle /filedrop/* {
+		reverse_proxy 127.0.0.1:8090
+	}
+
+	# The existing site, now in its own handle so the two never overlap.
+	handle {
+		reverse_proxy 127.0.0.1:3000
+	}
+}

@@ -32,4 +32,7 @@ go.work.sum
 # .idea/
 # .vscode/
 .vibe-wise
-filedrop
+/filedrop
+
+# Cross-compiled release binaries (scripts/build-linux.sh)
+/dist/

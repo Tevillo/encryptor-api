@@ -121,12 +121,19 @@ func (c *Cleaner) remove(ctx context.Context, id string) error {
 	return nil
 }
 
-// Run does the startup work, sweeps immediately, then sweeps every interval
-// until ctx is cancelled. A failed sweep is logged and retried next time.
+// Run does the startup work, then Loop.
 func (c *Cleaner) Run(ctx context.Context) error {
 	if err := c.Startup(ctx); err != nil {
 		return err
 	}
+	return c.Loop(ctx)
+}
+
+// Loop sweeps immediately, then every interval until ctx is cancelled. A
+// failed sweep is logged and retried next time. Call Startup first; serve
+// does so before accepting HTTP requests, so a new upload can't be mistaken
+// for a leftover.
+func (c *Cleaner) Loop(ctx context.Context) error {
 	ticker := time.NewTicker(c.interval)
 	defer ticker.Stop()
 	for {

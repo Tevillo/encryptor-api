@@ -114,3 +114,25 @@ func (d *DB) RevokeAPIKey(ctx context.Context, name string) (files int64, err er
 	}
 	return files, tx.Commit()
 }
+
+// GetAPIKeyByHash finds the key whose SHA-256 hash matches. Used to
+// authenticate requests: the incoming key is hashed and looked up.
+func (d *DB) GetAPIKeyByHash(ctx context.Context, keyHash []byte) (APIKey, error) {
+	var (
+		k       APIKey
+		revoked int
+		created int64
+	)
+	err := d.QueryRowContext(ctx,
+		`SELECT id, name, revoked, created_at FROM api_keys WHERE key_hash = ?`, keyHash).
+		Scan(&k.ID, &k.Name, &revoked, &created)
+	if errors.Is(err, sql.ErrNoRows) {
+		return APIKey{}, ErrKeyNotFound
+	}
+	if err != nil {
+		return APIKey{}, fmt.Errorf("get api key: %w", err)
+	}
+	k.Revoked = revoked == 1
+	k.CreatedAt = time.Unix(created, 0)
+	return k, nil
+}

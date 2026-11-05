@@ -249,3 +249,17 @@ func (dl *Download) Finish(ctx context.Context, success bool) (exhausted bool, e
 	dl.f.Close()
 	return dl.s.db.ReleaseSlot(context.WithoutCancel(ctx), dl.File.ID, success, dl.s.now())
 }
+
+// StillAvailable reports ErrGone if the file was deleted (for example by
+// revoking its key) after this download started. Long downloads call it
+// periodically so a revoke cuts them off.
+func (dl *Download) StillAvailable(ctx context.Context) error {
+	f, err := dl.s.db.GetFile(ctx, dl.File.ID)
+	if err != nil {
+		return err
+	}
+	if f.Status == db.StatusDeleted {
+		return db.ErrGone
+	}
+	return nil
+}
