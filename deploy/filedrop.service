@@ -1,0 +1,25 @@
+# systemd unit for filedrop. Install with:
+#   sudo cp deploy/filedrop.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now filedrop
+
+[Unit]
+Description=filedrop encrypted file sharing
+After=network.target
+# Wait for the drives holding the master key and the data. Without this, after
+# a reboot the service could start before /mnt/chi is mounted and find no key.
+RequiresMountsFor=/mnt/chi/secrets/filedrop /srv/filedrop
+
+[Service]
+Type=simple
+User=filedrop
+Group=filedrop
+EnvironmentFile=/srv/filedrop/.env
+ExecStart=/usr/local/bin/filedrop serve
+# serve gives transfers up to 30s to finish after SIGTERM.
+TimeoutStopSec=45s
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

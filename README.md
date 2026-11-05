@@ -5,8 +5,9 @@ My own encryption implementation for my website to share files
 
 > **Status:** early development. `filedrop serve` accepts encrypted uploads
 > and serves downloads over HTTP, and its cleaner removes expired, used-up and
-> revoked files. Not done yet: deployment behind Caddy/systemd and a browser
-> frontend.
+> revoked files. See [Deploying to the server](#deploying-to-the-server) for
+> running it behind Caddy and systemd. The browser frontend is a separate
+> project.
 
 ## Requirements
 
@@ -20,6 +21,12 @@ go build -o filedrop ./cmd/filedrop
 ```
 
 This produces a single `filedrop` binary. Every command below is a subcommand of it.
+
+To build for the server (Linux, x86-64) from any machine:
+
+```sh
+scripts/build-linux.sh   # writes dist/filedrop
+```
 
 ## Configuration
 
@@ -257,9 +264,155 @@ upload leaves nothing behind.
 
 ### Not built yet
 
-- Deployment: a systemd unit and the Caddy route for `/filedrop/*`.
-- A browser frontend. It will need its own way to authenticate senders, since
-  an API key embedded in a web page is visible to anyone using it.
+- A browser frontend (a separate project). It will need its own way to
+  authenticate senders, since an API key embedded in a web page is visible to
+  anyone using it.
+
+## Deploying to the server
+
+The server runs Caddy for HTTPS. Caddy passes `paulborrego.com/filedrop/*` to
+filedrop on `127.0.0.1:8090`; nothing else can reach filedrop directly.
+
+| What | Where | Owner, mode |
+| --- | --- | --- |
+| Program | `/usr/local/bin/filedrop` | root, `0755` (the service can run it but not change it) |
+| Settings | `/srv/filedrop/.env` | filedrop, `0600` |
+| Database | `/srv/filedrop/filedrop.db` | filedrop (inside `0700` folder) |
+| Encrypted files | `/srv/filedrop/files/` | filedrop, `0700` |
+| Master key | `/mnt/chi/secrets/filedrop/master.key` | filedrop, `0400` (folder `0700`), on a different drive from the data |
+
+Deployment has two stages: run it by hand and test it from outside, then hand
+it to systemd.
+
+### 1. Build and copy (on the desktop)
+
+```sh
+scripts/build-linux.sh
+scp dist/filedrop deploy/filedrop.service .env.example SERVER:/tmp/
+```
+
+### 2. Create the user and folders (on the server)
+
+```sh
+sudo useradd --system --home-dir /srv/filedrop --shell /usr/sbin/nologin filedrop
+sudo install -d -o filedrop -g filedrop -m 0700 /srv/filedrop
+sudo install -d -o filedrop -g filedrop -m 0700 /mnt/chi/secrets/filedrop
+sudo install -o root -g root -m 0755 /tmp/filedrop /usr/local/bin/filedrop
+```
+
+The filedrop user must be able to pass through `/mnt/chi` and
+`/mnt/chi/secrets` to reach its key folder. Check with
+`sudo -u filedrop ls /mnt/chi/secrets/filedrop`; "Permission denied" means a
+parent folder lacks the `x` permission for other users.
+
+### 3. Settings
+
+Edit `/tmp/.env.example` so these lines read:
+
+```sh
+FILEDROP_DB=/srv/filedrop/filedrop.db
+FILEDROP_MASTER_KEY=/mnt/chi/secrets/filedrop/master.key
+FILEDROP_DATA_DIR=/srv/filedrop/files
+FILEDROP_PUBLIC_URL=https://paulborrego.com/filedrop
+```
+
+then install it:
+
+```sh
+sudo install -o filedrop -g filedrop -m 0600 /tmp/.env.example /srv/filedrop/.env
+```
+
+### 4. Run commands as the filedrop user
+
+Every command on the server runs as `filedrop` with the settings loaded, the
+same way systemd will run it, so permission problems show up now rather than
+later. This shell function does that (add it to your shell config to keep it):
+
+```sh
+fdrop() {
+  sudo -u filedrop sh -c 'cd /srv/filedrop && set -a && . ./.env && set +a && exec /usr/local/bin/filedrop "$@"' filedrop "$@"
+}
+```
+
+Then create the master key and an API key:
+
+```sh
+fdrop masterkey init
+fdrop keys create --name laptop     # prints the key once
+```
+
+Back up the master key somewhere other than the server's data drive: losing it
+makes every stored file unreadable.
+
+### 5. Add the Caddy route
+
+Change the `paulborrego.com` site block as shown in
+[`deploy/Caddyfile.snippet`](deploy/Caddyfile.snippet), then:
+
+```sh
+sudo caddy validate --config /etc/caddy/Caddyfile
+sudo systemctl reload caddy
+```
+
+Use `handle`, not `handle_path`: `handle_path` removes `/filedrop` from the
+path and every request would get `404`.
+
+### 6. Run by hand and test from another network
+
+On the server (in `tmux` or a spare terminal):
+
+```sh
+fdrop serve
+```
+
+From a device on a **different network** (not the server's LAN), so the
+request goes through DNS, HTTPS and Caddy like a real user's:
+
+```sh
+KEY=fd_...                               # from step 4
+head -c 300M /dev/urandom > big.bin
+sha256sum big.bin                        # macOS: shasum -a 256
+
+# Upload: prints an https://paulborrego.com/filedrop/... link
+LINK=$(curl -fsS -T big.bin -H "Authorization: Bearer $KEY" https://paulborrego.com/filedrop/)
+echo "$LINK"
+
+# Download: the hash must match the one above
+curl -fsS -o got.bin "$LINK" && sha256sum got.bin
+
+# Second download of a 1-download file: expect 410
+curl -s -o /dev/null -w '%{http_code}\n' "$LINK"
+
+# Wrong key: expect 401
+echo hi > small.txt
+curl -s -o /dev/null -w '%{http_code}\n' -T small.txt -H "Authorization: Bearer fd_wrong" https://paulborrego.com/filedrop/
+```
+
+Stop `fdrop serve` with Ctrl-C when done.
+
+### 7. Hand it to systemd
+
+```sh
+sudo cp /tmp/filedrop.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now filedrop
+systemctl status filedrop
+journalctl -u filedrop -f                # logs
+```
+
+Run the test from step 6 again. The unit waits for `/mnt/chi` to be mounted
+before starting, so the service still finds its key after a reboot.
+
+### Updating
+
+```sh
+scripts/build-linux.sh && scp dist/filedrop SERVER:/tmp/           # desktop
+sudo install -o root -g root -m 0755 /tmp/filedrop /usr/local/bin/filedrop \
+  && sudo systemctl restart filedrop                                # server
+```
+
+A restart stops transfers in progress (after up to 30 seconds); their
+download slots are released when the service starts again.
 
 ## Development
 
