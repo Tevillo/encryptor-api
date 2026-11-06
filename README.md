@@ -1,192 +1,70 @@
-# API Encryptor
----
+# filedrop
 
-My own encryption implementation for my website to share files
+A small self-hosted service for sharing files through expiring links. Senders
+upload with an API key and get back a share link; anyone with the link can
+download the file until it expires or runs out of downloads. Files are
+encrypted as they arrive and never stored unencrypted.
 
-> **Status:** early development. `filedrop serve` accepts encrypted uploads
-> and serves downloads over HTTP, and its cleaner removes expired, used-up and
-> revoked files. See [Deploying to the server](#deploying-to-the-server) for
-> running it behind Caddy and systemd. The browser frontend is a separate
-> project.
+> **Status:** early development. Uploads, downloads, expiry, download limits
+> and cleanup work, and the service can be deployed behind Caddy and systemd.
+> There is no browser frontend yet.
 
-## Requirements
+## Contents
 
-- Go 1.27 or newer
-- `sqlite3` (optional, only for inspecting the database by hand)
+- [How it works](#how-it-works)
+- [Quick start](#quick-start)
+- [Uploading and downloading](#uploading-and-downloading)
+- [Administration](#administration)
+- [Configuration](#configuration)
+- [Deployment](#deployment)
+- [Development](#development)
+- [Limitations](#limitations)
 
-## Build
+## How it works
+
+```
+sender ──PUT + API key──▶ reverse proxy (HTTPS) ──▶ filedrop ──▶ SQLite + encrypted files
+recipient ──share link──▶ reverse proxy (HTTPS) ──▶ filedrop ──▶ decrypt and stream
+```
+
+- **One program.** `filedrop` is a single binary: `filedrop serve` runs the
+  HTTP server and the cleaner; the other subcommands manage keys.
+- **Encryption.** Each file gets its own random data key and is encrypted as it
+  streams in (AES-256-GCM, [DARE](https://github.com/minio/sio) format). The
+  data key is itself encrypted ("wrapped") with a **master key** and stored in
+  the database. Keep the master key on a different drive from the data: a copy
+  of the data folder alone can't be decrypted.
+- **Metadata** (API keys, file records, limits) lives in a SQLite database.
+- **Share links** contain a random 128-bit file ID; the link is the only thing
+  a recipient needs.
+- **API keys** are stored only as SHA-256 hashes.
+- **Cleanup.** A cleaner inside `serve` periodically deletes files that have
+  expired, used up their downloads, or belong to a revoked key.
+
+## Quick start
+
+Requires Go 1.27 or newer. Everything here runs locally with the default
+settings (files under `~/.local/share/filedrop/`).
 
 ```sh
 go build -o filedrop ./cmd/filedrop
+
+./filedrop masterkey init                    # once; never overwrites an existing key
+KEY=$(./filedrop keys create --name laptop)  # the key is shown only once
+./filedrop serve                             # listens on 127.0.0.1:8090
 ```
 
-This produces a single `filedrop` binary. Every command below is a subcommand of it.
-
-To build for the server (Linux, x86-64) from any machine:
+In another terminal:
 
 ```sh
-scripts/build-linux.sh   # writes dist/filedrop
+LINK=$(curl -fsS -T notes.txt -H "Authorization: Bearer $KEY" http://127.0.0.1:8090/filedrop/)
+curl -OJ "$LINK"
 ```
-
-## Configuration
-
-Settings come from environment variables, normally kept in a `.env` file.
-Copy the example and edit it:
-
-```sh
-cp .env.example .env
-```
-
-| Variable | What it sets | Default | Flag override |
-| --- | --- | --- | --- |
-| `FILEDROP_DB` | SQLite database file | `~/.local/share/filedrop/filedrop.db` | `--db PATH` |
-| `FILEDROP_MASTER_KEY` | Master key file | `~/.local/share/filedrop/master.key` | `--master-key PATH` |
-| `FILEDROP_DATA_DIR` | Directory for encrypted files | `~/.local/share/filedrop/files` | none |
-| `FILEDROP_MAX_FILE_BYTES` | Largest single upload, in bytes | `2147483648` (2 GiB) | none |
-| `FILEDROP_MAX_TOTAL_BYTES` | Total size of all stored files, in bytes | `10737418240` (10 GiB) | none |
-| `FILEDROP_SWEEP_INTERVAL` | How often the cleaner runs (Go duration, at least `1s`) | `5m` | none |
-| `FILEDROP_LISTEN` | Address the HTTP server listens on | `127.0.0.1:8090` | none |
-| `FILEDROP_PUBLIC_URL` | Start of every share link (no trailing slash) | `http://<FILEDROP_LISTEN>/filedrop` | none |
-
-A flag beats the environment variable, which beats the default. Directories are
-created automatically. The database schema is created or upgraded automatically
-whenever a command opens it.
-
-`.env` is git-ignored; never commit it.
-
-### Loading `.env`
-
-Go doesn't read `.env` by itself; something has to turn it into environment
-variables.
-
-- **On the server (systemd):** the service unit loads it with
-  `EnvironmentFile=/path/to/.env`.
-- **For CLI commands in a shell** (on the server or this desktop), load it first
-  so the CLI uses the same database and key as the service:
-
-  ```sh
-  set -a; . ./.env; set +a
-  ./filedrop keys list
-  ```
-
-  Without this step, the CLI falls back to the default paths, which on the server
-  would be the wrong database.
-
-On the server, keep the master key on a **different drive** from the database and
-uploaded files, owned by the service's own user.
-
-## First-time setup
-
-### 1. Create the master key
-
-```sh
-./filedrop masterkey init
-```
-
-This writes 32 random bytes to the master key file with permissions `0400`
-(readable only by its owner). It will **never overwrite** an existing key: if
-the file is already there, the command fails. Losing or replacing the master key
-makes every stored file unreadable.
-
-Back the key up somewhere separate from the database and the uploaded files.
-
-### 2. Create the database
-
-There is no separate step: the database file and its tables (`api_keys` and
-`files`) are created automatically the first time any command opens it. Running
-the next step, or simply
-
-```sh
-./filedrop keys list
-```
-
-creates them at the path in `FILEDROP_DB`.
-
-How it works: the table definitions live in `internal/db/migrations/` as numbered
-SQL files (`0001_init.sql`, ...) that are built into the binary. SQLite stores
-the number of the last one applied (`PRAGMA user_version`). Each time a command
-opens the database, any newer migration files are applied once, in order, so
-upgrading the binary also upgrades the schema.
-
-To look at the tables yourself:
-
-```sh
-sqlite3 "$FILEDROP_DB" '.tables'            # api_keys  files
-sqlite3 "$FILEDROP_DB" '.schema files'      # full table definition
-sqlite3 "$FILEDROP_DB" 'PRAGMA user_version' # last migration applied
-```
-
-### 3. Create an API key
-
-```sh
-./filedrop keys create --name laptop
-```
-
-The key (it starts with `fd_`) is printed **once**. Only its SHA-256 hash is
-saved, so it can't be shown again. If you lose it, create a new one.
-
-The key is the only thing written to standard output, so you can capture it:
-
-```sh
-KEY=$(./filedrop keys create --name laptop)
-```
-
-Each key needs a unique name of at most 64 characters.
-
-## Commands
-
-| Command | What it does |
-| --- | --- |
-| `filedrop masterkey init` | Create the master key (refuses to overwrite) |
-| `filedrop keys create --name NAME` | Create an API key and print it once |
-| `filedrop keys list` | List keys: ID, name, creation time, revoked status (never the keys themselves) |
-| `filedrop keys revoke NAME` | Revoke a key; its files become undownloadable at once and are removed from disk by the next sweep |
-| `filedrop serve` | Run the service: the HTTP server and the cleaner. Stop it with Ctrl-C or SIGTERM |
-
-## Running the service and cleanup
-
-```sh
-set -a; . ./.env; set +a
-./filedrop serve
-```
-
-`serve` runs the HTTP server on `FILEDROP_LISTEN` and the cleaner, until
-stopped with Ctrl-C (or SIGTERM, which systemd sends). On stop it accepts no
-new requests and gives transfers in progress up to 30 seconds to finish.
-
-Logs go to standard error; under systemd, `journalctl` shows them. Requests are
-logged by route (`GET /filedrop/{id}`), never by their real path, and file IDs
-are cut to 6 characters, because the full ID is the secret part of a share link.
-
-### Cleanup
-
-The **cleaner** is the one part of the program that deletes files. On startup
-it releases any download slots left over from a previous run and abandons
-unfinished uploads, before the HTTP server accepts requests. It then sweeps
-immediately and again every `FILEDROP_SWEEP_INTERVAL`. Each sweep:
-
-1. marks files that have **expired** or **used up their downloads**, and that
-   nobody is currently downloading, as deleted, which also frees their storage;
-2. removes the encrypted data of every deleted file from disk.
-
-A file being downloaded is never removed mid-download; the next sweep after
-the download finishes takes care of it.
-
-### Revoking a key
-
-```sh
-./filedrop keys revoke laptop
-```
-
-The key stops working, and every file it uploaded becomes undownloadable
-immediately. Downloads already in progress are cut off within about 10 seconds.
-The files are removed from disk on the cleaner's next sweep. Revoking can't be
-undone; create a new key instead.
 
 ## Uploading and downloading
 
-Examples use `https://paulborrego.com/filedrop`; locally, use your
-`FILEDROP_PUBLIC_URL` (by default `http://127.0.0.1:8090/filedrop`).
+Examples use `https://example.com/filedrop`; replace it with your
+`FILEDROP_PUBLIC_URL` (locally, `http://127.0.0.1:8090/filedrop`).
 
 ### Upload
 
@@ -194,16 +72,14 @@ Examples use `https://paulborrego.com/filedrop`; locally, use your
 curl -T "holiday photo.jpg" \
      -H "Authorization: Bearer $KEY" \
      --url-query expires=2h --url-query downloads=3 \
-     https://paulborrego.com/filedrop/
+     https://example.com/filedrop/
 ```
 
-The response is the share link, on one line:
+The response is the share link, on one line, so `LINK=$(curl ...)` captures it:
 
 ```
-https://paulborrego.com/filedrop/lLwqZ6_kBjVaTSUo0ww8mA
+https://example.com/filedrop/lLwqZ6_kBjVaTSUo0ww8mA
 ```
-
-so `LINK=$(curl ...)` captures it.
 
 - `-T FILE` sends the file as the request body. Because the URL ends in `/`,
   curl adds the file name to it (`.../filedrop/holiday%20photo.jpg`), and that
@@ -213,8 +89,7 @@ so `LINK=$(curl ...)` captures it.
   `.../filedrop/?expires=2h` the name is dropped and the server answers `404`.
   (Alternatively, write the name yourself:
   `.../filedrop/holiday%20photo.jpg?expires=2h`.)
-- The file is encrypted as it arrives; the unencrypted contents never touch the
-  server's disk.
+- The upload must have a `Content-Length`, so send a file, not a pipe.
 
 | Setting | Values | Default |
 | --- | --- | --- |
@@ -229,17 +104,22 @@ silently using the default.
 Anyone with the link can download; no key is needed:
 
 ```sh
-curl -OJ https://paulborrego.com/filedrop/lLwqZ6_kBjVaTSUo0ww8mA
+curl -OJ https://example.com/filedrop/lLwqZ6_kBjVaTSUo0ww8mA
 ```
 
-`-O -J` saves the file under its original name. Each successful download uses
-one of the file's downloads; a download that fails partway doesn't. While all
-remaining downloads are in progress at once, further requests get `409`.
-`HEAD` requests are refused so they can't use up a download.
+`-O -J` saves the file under its original name.
 
-**Link previews:** chat apps (Slack, iMessage, ...) often fetch pasted links to
-build a preview, and that fetch counts as a download. Share links where that
-won't happen, or allow more than one download.
+- Each successful download uses one of the file's downloads; a download that
+  fails partway doesn't.
+- While all remaining downloads are in progress at once, further requests get
+  `409`.
+- `HEAD` requests are refused so they can't use up a download.
+- A transfer (upload or download) that makes no progress for 60 seconds is cut
+  off. A cut-off upload leaves nothing behind.
+
+**Link previews:** chat apps often fetch pasted links to build a preview, and
+that fetch counts as a download. Share links where that won't happen, or allow
+more than one download.
 
 ### Responses
 
@@ -259,51 +139,178 @@ won't happen, or allow more than one download.
 
 Errors are a single line of text starting with `error:`.
 
-A transfer that makes no progress for 60 seconds is cut off, and a cut-off
-upload leaves nothing behind.
+## Administration
 
-### Not built yet
+All commands read their settings from the environment; see
+[Loading `.env`](#loading-env).
 
-- A browser frontend (a separate project). It will need its own way to
-  authenticate senders, since an API key embedded in a web page is visible to
-  anyone using it.
+| Command | What it does |
+| --- | --- |
+| `filedrop masterkey init` | Create the master key (refuses to overwrite) |
+| `filedrop keys create --name NAME` | Create an API key and print it once |
+| `filedrop keys list` | List keys: ID, name, creation time, revoked status (never the keys themselves) |
+| `filedrop keys revoke NAME` | Revoke a key and delete its files |
+| `filedrop serve` | Run the HTTP server and the cleaner until Ctrl-C or SIGTERM |
 
-## Deploying to the server
+### Master key
 
-The server runs Caddy for HTTPS. Caddy passes `paulborrego.com/filedrop/*` to
-filedrop on `127.0.0.1:8090`; nothing else can reach filedrop directly.
+`filedrop masterkey init` writes 32 random bytes to `FILEDROP_MASTER_KEY` with
+permissions `0400` (readable only by its owner). It **never overwrites** an
+existing key. Losing or replacing the master key makes every stored file
+unreadable, so back it up somewhere separate from the database and the
+uploaded files.
+
+### API keys
+
+```sh
+filedrop keys create --name laptop
+```
+
+The key starts with `fd_` and is printed **once**, as the only thing on
+standard output. Only its hash is saved, so it can't be shown again; if it's
+lost, create a new one. Each key needs a unique name of at most 64 characters.
+
+```sh
+filedrop keys revoke laptop
+```
+
+Revoking is permanent. The key stops working and every file it uploaded
+becomes undownloadable immediately; downloads already in progress are cut off
+within about 10 seconds, and the files are removed from disk on the cleaner's
+next sweep.
+
+### Running the service
+
+`filedrop serve` runs the HTTP server on `FILEDROP_LISTEN` together with the
+cleaner. On Ctrl-C or SIGTERM it stops accepting requests and gives transfers
+in progress up to 30 seconds to finish.
+
+**Cleaner.** On startup it releases download slots left over from a previous
+run and abandons unfinished uploads, before the HTTP server accepts requests.
+It then sweeps immediately and every `FILEDROP_SWEEP_INTERVAL`. Each sweep
+marks files that have expired or used up their downloads, and that nobody is
+downloading, as deleted (freeing their storage), then removes the encrypted
+data of every deleted file from disk. A file is never removed mid-download.
+
+### Logs
+
+Logs are plain `key=value` lines on standard error at Info level (under
+systemd, see `journalctl -u filedrop`). They record each request's method,
+route, status, size and duration; uploads (short file ID, key name, size,
+limits); completed downloads; cleaner actions; and errors.
+
+They never record full file IDs (the secret part of a share link), API keys,
+file names, or client addresses. Requests are logged by route
+(`GET /filedrop/{id}`), and file IDs are cut to 6 characters. A reverse proxy
+with access logging enabled will still record full URLs.
+
+## Configuration
+
+Settings come from environment variables, normally kept in a `.env` file:
+
+```sh
+cp .env.example .env
+```
+
+| Variable | What it sets | Default | Flag override |
+| --- | --- | --- | --- |
+| `FILEDROP_DB` | SQLite database file | `~/.local/share/filedrop/filedrop.db` | `--db PATH` |
+| `FILEDROP_MASTER_KEY` | Master key file | `~/.local/share/filedrop/master.key` | `--master-key PATH` |
+| `FILEDROP_DATA_DIR` | Directory for encrypted files | `~/.local/share/filedrop/files` | none |
+| `FILEDROP_MAX_FILE_BYTES` | Largest single upload, in bytes | `2147483648` (2 GiB) | none |
+| `FILEDROP_MAX_TOTAL_BYTES` | Total size of all stored files, in bytes | `10737418240` (10 GiB) | none |
+| `FILEDROP_SWEEP_INTERVAL` | How often the cleaner runs (Go duration, at least `1s`) | `5m` | none |
+| `FILEDROP_LISTEN` | Address the HTTP server listens on | `127.0.0.1:8090` | none |
+| `FILEDROP_PUBLIC_URL` | Start of every share link (no trailing slash) | `http://<FILEDROP_LISTEN>/filedrop` | none |
+
+A flag beats the environment variable, which beats the default. Directories are
+created automatically. `.env` is git-ignored; never commit it.
+
+### Loading `.env`
+
+Go doesn't read `.env` by itself; something has to turn it into environment
+variables.
+
+- **systemd:** the unit loads it with `EnvironmentFile=`.
+- **A shell:** export it before running commands, so the CLI uses the same
+  database and key as the service:
+
+  ```sh
+  set -a; . ./.env; set +a
+  ./filedrop keys list
+  ```
+
+  `set -a` matters: a plain `. ./.env` sets the variables without exporting
+  them, and the CLI silently falls back to the default paths.
+
+### Database
+
+The database and its tables are created automatically the first time any
+command opens it; there is no separate setup step. Table definitions live in
+`internal/db/migrations/` as numbered SQL files built into the binary. SQLite
+records the last one applied (`PRAGMA user_version`), and any newer ones are
+applied in order when the database is opened, so upgrading the binary also
+upgrades the schema.
+
+```sh
+sqlite3 "$FILEDROP_DB" '.tables'             # api_keys  files
+sqlite3 "$FILEDROP_DB" '.schema files'       # full table definition
+sqlite3 "$FILEDROP_DB" 'PRAGMA user_version' # last migration applied
+```
+
+## Deployment
+
+This section deploys filedrop on a Linux server with systemd, behind
+[Caddy](https://caddyserver.com/) for HTTPS. filedrop listens only on
+`127.0.0.1`, so the reverse proxy is the only way in. Replace these
+placeholders throughout:
+
+| Placeholder | Meaning |
+| --- | --- |
+| `example.com` | Your domain |
+| `user@server` | SSH login for the server |
+| `/mnt/keys` | A drive **other than** the one holding `/srv`, for the master key |
+
+Layout:
 
 | What | Where | Owner, mode |
 | --- | --- | --- |
 | Program | `/usr/local/bin/filedrop` | root, `0755` (the service can run it but not change it) |
 | Settings | `/srv/filedrop/.env` | filedrop, `0600` |
-| Database | `/srv/filedrop/filedrop.db` | filedrop (inside `0700` folder) |
+| Database | `/srv/filedrop/filedrop.db` | filedrop (inside a `0700` folder) |
 | Encrypted files | `/srv/filedrop/files/` | filedrop, `0700` |
-| Master key | `/mnt/chi/secrets/filedrop/master.key` | filedrop, `0400` (folder `0700`), on a different drive from the data |
+| Master key | `/mnt/keys/filedrop/master.key` | filedrop, `0400` (folder `0700`) |
 
-Deployment has two stages: run it by hand and test it from outside, then hand
-it to systemd.
+Deployment has two stages: run the service by hand and test it from outside,
+then hand it to systemd. If something fails in the first stage, the cause is
+the proxy or permissions, not systemd.
 
-### 1. Build and copy (on the desktop)
+### 1. Build and copy
+
+On your own machine:
 
 ```sh
-scripts/build-linux.sh
-scp dist/filedrop deploy/filedrop.service .env.example SERVER:/tmp/
+scripts/build-linux.sh                 # dist/filedrop for linux/amd64
+scp dist/filedrop deploy/filedrop.service .env.example user@server:/tmp/
 ```
 
-### 2. Create the user and folders (on the server)
+The build has no C dependencies, so it runs on any Linux server. For an ARM
+server, run `GOARCH=arm64 scripts/build-linux.sh`.
+
+### 2. Create the user and folders
+
+On the server:
 
 ```sh
 sudo useradd --system --home-dir /srv/filedrop --shell /usr/sbin/nologin filedrop
 sudo install -d -o filedrop -g filedrop -m 0700 /srv/filedrop
-sudo install -d -o filedrop -g filedrop -m 0700 /mnt/chi/secrets/filedrop
+sudo install -d -o filedrop -g filedrop -m 0700 /mnt/keys/filedrop
 sudo install -o root -g root -m 0755 /tmp/filedrop /usr/local/bin/filedrop
 ```
 
-The filedrop user must be able to pass through `/mnt/chi` and
-`/mnt/chi/secrets` to reach its key folder. Check with
-`sudo -u filedrop ls /mnt/chi/secrets/filedrop`; "Permission denied" means a
-parent folder lacks the `x` permission for other users.
+The `filedrop` user must be able to pass through every folder above its key
+folder. Check with `sudo -u filedrop ls /mnt/keys/filedrop`; "Permission
+denied" means a parent folder lacks the `x` permission for other users.
 
 ### 3. Settings
 
@@ -311,9 +318,9 @@ Edit `/tmp/.env.example` so these lines read:
 
 ```sh
 FILEDROP_DB=/srv/filedrop/filedrop.db
-FILEDROP_MASTER_KEY=/mnt/chi/secrets/filedrop/master.key
+FILEDROP_MASTER_KEY=/mnt/keys/filedrop/master.key
 FILEDROP_DATA_DIR=/srv/filedrop/files
-FILEDROP_PUBLIC_URL=https://paulborrego.com/filedrop
+FILEDROP_PUBLIC_URL=https://example.com/filedrop
 ```
 
 then install it:
@@ -322,11 +329,11 @@ then install it:
 sudo install -o filedrop -g filedrop -m 0600 /tmp/.env.example /srv/filedrop/.env
 ```
 
-### 4. Run commands as the filedrop user
+### 4. Create the keys as the filedrop user
 
-Every command on the server runs as `filedrop` with the settings loaded, the
-same way systemd will run it, so permission problems show up now rather than
-later. This shell function does that (add it to your shell config to keep it):
+Run every command on the server as `filedrop` with the settings loaded, the
+same way systemd will, so permission problems show up now. This shell function
+does that (add it to your shell config to keep it):
 
 ```sh
 fdrop() {
@@ -334,30 +341,42 @@ fdrop() {
 }
 ```
 
-Then create the master key and an API key:
-
 ```sh
 fdrop masterkey init
 fdrop keys create --name laptop     # prints the key once
 ```
 
-Back up the master key somewhere other than the server's data drive: losing it
-makes every stored file unreadable.
+Back up the master key somewhere other than the server's data drive.
 
 ### 5. Add the Caddy route
 
-Change the `paulborrego.com` site block as shown in
-[`deploy/Caddyfile.snippet`](deploy/Caddyfile.snippet), then:
+In the Caddyfile (often `/etc/caddy/Caddyfile`), route `/filedrop/*` to
+filedrop inside your site's block, as in
+[`deploy/Caddyfile.snippet`](deploy/Caddyfile.snippet):
+
+```
+example.com {
+	handle /filedrop/* {
+		reverse_proxy 127.0.0.1:8090
+	}
+
+	# Anything the site already served goes in its own handle.
+	handle {
+		reverse_proxy 127.0.0.1:3000
+	}
+}
+```
+
+Caddy picks one `handle` block per request, the most specific match. Use
+`handle`, not `handle_path`: `handle_path` strips `/filedrop` from the path
+and every request would get `404`. Then:
 
 ```sh
 sudo caddy validate --config /etc/caddy/Caddyfile
 sudo systemctl reload caddy
 ```
 
-Use `handle`, not `handle_path`: `handle_path` removes `/filedrop` from the
-path and every request would get `404`.
-
-### 6. Run by hand and test from another network
+### 6. Run by hand and test from outside
 
 On the server (in `tmux` or a spare terminal):
 
@@ -365,16 +384,16 @@ On the server (in `tmux` or a spare terminal):
 fdrop serve
 ```
 
-From a device on a **different network** (not the server's LAN), so the
-request goes through DNS, HTTPS and Caddy like a real user's:
+From a device on a **different network**, so requests go through DNS, HTTPS
+and the proxy like a real user's:
 
 ```sh
 KEY=fd_...                               # from step 4
 head -c 300M /dev/urandom > big.bin
 sha256sum big.bin                        # macOS: shasum -a 256
 
-# Upload: prints an https://paulborrego.com/filedrop/... link
-LINK=$(curl -fsS -T big.bin -H "Authorization: Bearer $KEY" https://paulborrego.com/filedrop/)
+# Upload: prints an https://example.com/filedrop/... link
+LINK=$(curl -fsS -T big.bin -H "Authorization: Bearer $KEY" https://example.com/filedrop/)
 echo "$LINK"
 
 # Download: the hash must match the one above
@@ -385,12 +404,15 @@ curl -s -o /dev/null -w '%{http_code}\n' "$LINK"
 
 # Wrong key: expect 401
 echo hi > small.txt
-curl -s -o /dev/null -w '%{http_code}\n' -T small.txt -H "Authorization: Bearer fd_wrong" https://paulborrego.com/filedrop/
+curl -s -o /dev/null -w '%{http_code}\n' -T small.txt -H "Authorization: Bearer fd_wrong" https://example.com/filedrop/
 ```
 
 Stop `fdrop serve` with Ctrl-C when done.
 
 ### 7. Hand it to systemd
+
+Edit `/tmp/filedrop.service` so `RequiresMountsFor=` names your key folder,
+then:
 
 ```sh
 sudo cp /tmp/filedrop.service /etc/systemd/system/
@@ -400,19 +422,19 @@ systemctl status filedrop
 journalctl -u filedrop -f                # logs
 ```
 
-Run the test from step 6 again. The unit waits for `/mnt/chi` to be mounted
-before starting, so the service still finds its key after a reboot.
+Run the test from step 6 again. `RequiresMountsFor=` makes the service wait
+for the key drive to be mounted, so it still finds its key after a reboot.
 
 ### Updating
 
 ```sh
-scripts/build-linux.sh && scp dist/filedrop SERVER:/tmp/           # desktop
+scripts/build-linux.sh && scp dist/filedrop user@server:/tmp/      # your machine
 sudo install -o root -g root -m 0755 /tmp/filedrop /usr/local/bin/filedrop \
   && sudo systemctl restart filedrop                                # server
 ```
 
-A restart stops transfers in progress (after up to 30 seconds); their
-download slots are released when the service starts again.
+A restart stops transfers in progress (after up to 30 seconds); their download
+slots are released when the service starts again.
 
 ## Development
 
@@ -421,11 +443,20 @@ go vet ./...
 go test ./...
 ```
 
-To try the commands without touching your real files, point them at a
-throwaway folder:
+To try commands without touching your real files, point them at a throwaway
+folder:
 
 ```sh
 export FILEDROP_DB=/tmp/filedrop-test/filedrop.db
 export FILEDROP_MASTER_KEY=/tmp/filedrop-test/master.key
 export FILEDROP_DATA_DIR=/tmp/filedrop-test/files
 ```
+
+## Limitations
+
+- **No browser frontend yet.** It will need its own way to authenticate
+  senders, since an API key embedded in a web page is visible to anyone using
+  it.
+- **Server-side encryption, not end-to-end.** Anyone with a shell on the server
+  as the `filedrop` user (or root) can read the master key and decrypt files.
+- **Link previews count as downloads** (see [Download](#download)).

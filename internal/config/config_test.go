@@ -60,7 +60,7 @@ func TestLoadRejectsBadLimits(t *testing.T) {
 		{"negative", map[string]string{"FILEDROP_MAX_FILE_BYTES": "-5"}},
 		{"sweep interval not a duration", map[string]string{"FILEDROP_SWEEP_INTERVAL": "5"}},
 		{"sweep interval too short", map[string]string{"FILEDROP_SWEEP_INTERVAL": "10ms"}},
-		{"public url without scheme", map[string]string{"FILEDROP_PUBLIC_URL": "paulborrego.com/filedrop"}},
+		{"public url without scheme", map[string]string{"FILEDROP_PUBLIC_URL": "example.com/filedrop"}},
 		{"total below per-file", map[string]string{"FILEDROP_MAX_FILE_BYTES": "100", "FILEDROP_MAX_TOTAL_BYTES": "99"}},
 	}
 	for _, tt := range tests {

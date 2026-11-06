@@ -66,7 +66,7 @@ func Load(getenv func(string) string) (Config, error) {
 	c.Listen = orDefault(getenv("FILEDROP_LISTEN"), DefaultListen)
 	c.PublicURL = strings.TrimRight(orDefault(getenv("FILEDROP_PUBLIC_URL"), "http://"+c.Listen+"/filedrop"), "/")
 	if u, err := url.Parse(c.PublicURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		return Config{}, fmt.Errorf("FILEDROP_PUBLIC_URL must be an http(s) URL such as https://paulborrego.com/filedrop, got %q", c.PublicURL)
+		return Config{}, fmt.Errorf("FILEDROP_PUBLIC_URL must be an http(s) URL such as https://example.com/filedrop, got %q", c.PublicURL)
 	}
 	if c.MaxTotalBytes < c.MaxFileBytes {
 		return Config{}, fmt.Errorf("FILEDROP_MAX_TOTAL_BYTES (%d) must be at least FILEDROP_MAX_FILE_BYTES (%d)",

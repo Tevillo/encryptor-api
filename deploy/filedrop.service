@@ -7,8 +7,9 @@
 Description=filedrop encrypted file sharing
 After=network.target
 # Wait for the drives holding the master key and the data. Without this, after
-# a reboot the service could start before /mnt/chi is mounted and find no key.
-RequiresMountsFor=/mnt/chi/secrets/filedrop /srv/filedrop
+# a reboot the service could start before the key drive is mounted and find no
+# key. Change /mnt/keys/filedrop to your key folder.
+RequiresMountsFor=/mnt/keys/filedrop /srv/filedrop
 
 [Service]
 Type=simple

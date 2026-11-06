@@ -39,7 +39,7 @@ const (
 type Server struct {
 	db           *db.DB
 	store        *store.Store
-	publicURL    string // e.g. https://paulborrego.com/filedrop
+	publicURL    string // e.g. https://example.com/filedrop
 	maxFileBytes int64
 	log          *slog.Logger
 
