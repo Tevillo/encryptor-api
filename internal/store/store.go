@@ -24,7 +24,8 @@ import (
 )
 
 // MaxTTL is the longest a file may live.
-const MaxTTL = 24 * time.Hour
+// CHANGE MAX TIME HERE
+const MaxTTL = 48 * time.Hour
 
 var (
 	// ErrSizeMismatch means the input wasn't exactly the declared size.
